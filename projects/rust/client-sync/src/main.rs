@@ -51,9 +51,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )
             }
-            "echo" | "delete-user" | "put" | "get" | "delete" => {
+            "delete-user" | "put" | "get" | "delete" => {
                 println!("This task is not implemented in the starting code yet.");
                 continue;
+            }
+            "echo" => {
+                println!("Enter text (single '.' on a line to end):");
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                let text = rm_client_sync::read_text(&mut reader)?;
+                body = json!({
+                    "text": text
+                });
+                ("POST", "/echo")
             }
             _ => {
                 println!("Unknown command.");
