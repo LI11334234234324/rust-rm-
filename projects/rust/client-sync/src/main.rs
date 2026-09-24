@@ -51,10 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )
             }
-            "delete-user" | "get" | "delete" => {
-                println!("This task is not implemented in the starting code yet.");
-                continue;
-            }
             "echo" => {
                 println!("Enter text (single '.' on a line to end):");
                 let stdin = io::stdin();
@@ -76,6 +72,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 ("PUT", format!("/texts/{name}"))
             }
+            "get" => {
+                let name = input("name:")?;
+                ("GET", format!("/texts/{name}"))
+            }
+            "delete" => {
+                let name = input("name:")?;
+                ("DELETE", format!("/texts/{name}"))
+            }
+            "delete-user" => ("DELETE", "/users/me".into()),
             _ => {
                 println!("Unknown command.");
                 continue;
@@ -101,7 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if status == 401 {
                     println!("Please log in again.");
                 }
-                if status == 401 || (command == "logout" && status == 200) {
+                if status == 401
+                    || ((command == "logout" || command == "delete-user") && status == 200)
+                {
                     token.clear();
                 }
             }
