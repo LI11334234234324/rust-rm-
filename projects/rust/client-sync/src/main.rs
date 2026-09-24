@@ -35,23 +35,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         };
         let mut body = Value::Null;
-        let (method, path) = match command.as_str() {
+        let (method, path): (&str, String) = match command.as_str() {
             "q" => break,
-            "ping" => ("GET", "/ping"),
-            "list" => ("GET", "/texts"),
-            "logout" => ("DELETE", "/sessions/current"),
+            "ping" => ("GET", "/ping".into()),
+            "list" => ("GET", "/texts".into()),
+            "logout" => ("DELETE", "/sessions/current".into()),
             "register" | "login" => {
                 body = json!({"username": input("username: ")?, "password": rpassword::prompt_password("password: ")?});
                 (
                     "POST",
                     if command == "register" {
-                        "/users"
+                        "/users".into()
                     } else {
-                        "/sessions"
+                        "/sessions".into()
                     },
                 )
             }
-            "delete-user" | "put" | "get" | "delete" => {
+            "delete-user" | "get" | "delete" => {
                 println!("This task is not implemented in the starting code yet.");
                 continue;
             }
@@ -63,7 +63,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 body = json!({
                     "text": text
                 });
-                ("POST", "/echo")
+                ("POST", "/echo".into())
+            }
+            "put" => {
+                let name = input("name:")?;
+                println!("Enter text (single '.' on a line to end):");
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                let text = rm_client_sync::read_text(&mut reader)?;
+                body = json!({
+                    "text": text
+                });
+                ("PUT", format!("/texts/{name}"))
             }
             _ => {
                 println!("Unknown command.");
@@ -74,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &client,
             &args.url,
             method.parse().unwrap(),
-            path,
+            &path,
             &token,
             if body.is_null() { None } else { Some(&body) },
         );
