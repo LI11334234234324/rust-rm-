@@ -185,20 +185,146 @@ fn http_echo() {
 }
 
 #[test]
+fn http_text_lifecycle_and_isolation() {
+    let client = Client::tracked(create_app()).unwrap();
+    let alice_account = json!({"username": "alice", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&alice_account)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login_alice = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&alice_account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let alice_token = format!("Bearer {}", login_alice["data"]["token"].as_str().unwrap());
+
+    let bob_account = json!({"username": "bob", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&bob_account)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login_bob = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&bob_account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let bob_token = format!("Bearer {}", login_bob["data"]["token"].as_str().unwrap());
+
+    // 1. Alice creates text "note"
+    let res = client
+        .put("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "alice note"}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(res.into_json::<Value>().unwrap(), json!({"data": null}));
+
+    // 2. Alice reads text "note"
+    let res = client
+        .get("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(
+        res.into_json::<Value>().unwrap(),
+        json!({"data": "alice note"})
+    );
+
+    // 3. Bob tries to read "note" -> 404 (user isolation)
+    let res = client
+        .get("/texts/note")
+        .header(Header::new("Authorization", bob_token.clone()))
+        .dispatch();
+    assert_eq!(res.status(), Status::NotFound);
+
+    // 4. Bob creates his own "note"
+    let res = client
+        .put("/texts/note")
+        .header(Header::new("Authorization", bob_token.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "bob note"}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+
+    // 5. Check isolation: Alice and Bob have different contents
+    let res_alice = client
+        .get("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .dispatch();
+    assert_eq!(
+        res_alice.into_json::<Value>().unwrap(),
+        json!({"data": "alice note"})
+    );
+
+    let res_bob = client
+        .get("/texts/note")
+        .header(Header::new("Authorization", bob_token.clone()))
+        .dispatch();
+    assert_eq!(
+        res_bob.into_json::<Value>().unwrap(),
+        json!({"data": "bob note"})
+    );
+
+    // 6. Alice deletes "note"
+    let res = client
+        .delete("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+
+    // 7. Alice gets 404 on "note", but Bob's "note" still exists
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(Header::new("Authorization", bob_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+
+    // 8. Invalid name -> 400
+    assert_eq!(
+        client
+            .get("/texts/invalid!name")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::BadRequest
+    );
+}
+
+#[test]
 fn unimplemented_routes_are_absent() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
-    for (method, path) in [
-        (Method::Delete, "/users/me"),
-        (Method::Put, "/texts/note"),
-        (Method::Get, "/texts/note"),
-        (Method::Delete, "/texts/note"),
-    ] {
-        assert_eq!(
-            client.req(method, path).dispatch().status(),
-            Status::NotFound
-        );
-    }
+    assert_eq!(
+        client.req(Method::Delete, "/users/me").dispatch().status(),
+        Status::NotFound
+    );
     for path in [
         "/ping",
         "/users",

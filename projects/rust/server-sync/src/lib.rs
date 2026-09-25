@@ -19,6 +19,15 @@ pub const ROUTES: &[(&str, &str)] = &[
 ];
 
 pub fn route_error(method: &str, path: &str) -> Option<u16> {
+    if let Some(name) = path.strip_prefix("/texts/") {
+        if name.is_empty() || name.contains('/') {
+            return Some(404);
+        }
+        return match method {
+            "GET" | "PUT" | "DELETE" => None,
+            _ => Some(405),
+        };
+    }
     match ROUTES.iter().find(|(_, route)| *route == path) {
         None => Some(404),
         Some((allowed, _)) if *allowed != method => Some(405),
@@ -147,7 +156,8 @@ impl Service {
             // Later server task: record a deadline and include expires_in.
             return (200, json!({"data": {"token": token}}));
         }
-        let protected = matches!(path, "/texts" | "/sessions/current");
+        let protected =
+            matches!(path, "/texts" | "/sessions/current") || path.starts_with("/texts/");
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
             let mut users = self.users.lock().unwrap();
@@ -166,6 +176,38 @@ impl Service {
             }
             if method == "GET" && path == "/texts" {
                 return (200, json!({"data": user.texts.keys().collect::<Vec<_>>()}));
+            }
+            if let Some(text_name) = path.strip_prefix("/texts/") {
+                if !valid_name(text_name, 64) {
+                    return error(400, "Invalid text name");
+                }
+                if method == "GET" {
+                    if let Some(text) = user.texts.get(text_name) {
+                        return (200, json!({"data": text}));
+                    } else {
+                        return error(404, "Text not found");
+                    }
+                }
+                if method == "PUT" {
+                    let Some(text) = body.get("text").and_then(Value::as_str) else {
+                        return error(400, "Expected text");
+                    };
+                    if body.as_object().map(|v| v.len()) != Some(1) {
+                        return error(400, "Invalid fields");
+                    }
+                    if text.len() > 65_536 {
+                        return error(413, "Text too large"); // 413 超限
+                    }
+                    user.texts.insert(text_name.to_owned(), text.to_owned());
+                    return (200, json!({"data": null}));
+                }
+                if method == "DELETE" {
+                    if user.texts.remove(text_name).is_some() {
+                        return (200, json!({"data": null}));
+                    } else {
+                        return error(404, "Text not found");
+                    }
+                }
             }
         }
         error(404, "Not found")
