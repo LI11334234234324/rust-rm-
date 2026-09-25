@@ -121,7 +121,10 @@ fn http_input_and_routing() {
         Status::BadRequest
     );
     assert_eq!(client.get("/missing").dispatch().status(), Status::NotFound);
-    assert_eq!(client.get("/echo").dispatch().status(), Status::NotFound);
+    assert_eq!(
+        client.get("/echo").dispatch().status(),
+        Status::MethodNotAllowed
+    );
     assert_eq!(
         client.patch("/ping").dispatch().status(),
         Status::MethodNotAllowed
@@ -129,11 +132,63 @@ fn http_input_and_routing() {
 }
 
 #[test]
+fn http_echo() {
+    let client = Client::tracked(create_app()).unwrap();
+    let res = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(json!({"text": "Hello\nWorld! 🚀"}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(
+        res.into_json::<Value>().unwrap(),
+        json!({"data": "Hello\nWorld! 🚀"})
+    );
+
+    let res = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(r#"{"text":""}"#)
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+    assert_eq!(res.into_json::<Value>().unwrap(), json!({"data": ""}));
+
+    for body in [
+        r#"{}"#,
+        r#"{"text": 123}"#,
+        r#"{"text": true}"#,
+        r#"{"text": "hi", "extra": "field"}"#,
+    ] {
+        let res = client
+            .post("/echo")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch();
+        assert_eq!(res.status(), Status::BadRequest);
+    }
+
+    let large = "a".repeat(65_537);
+    let res = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(json!({"text": large}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::PayloadTooLarge);
+
+    let exact = "a".repeat(65_536);
+    let res = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(json!({"text": exact}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+}
+
+#[test]
 fn unimplemented_routes_are_absent() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
     for (method, path) in [
-        (Method::Post, "/echo"),
         (Method::Delete, "/users/me"),
         (Method::Put, "/texts/note"),
         (Method::Get, "/texts/note"),
