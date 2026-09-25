@@ -16,6 +16,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/sessions/current"),
     ("GET", "/texts"),
     ("POST", "/echo"),
+    ("DELETE", "/users/me"),
 ];
 
 pub fn route_error(method: &str, path: &str) -> Option<u16> {
@@ -156,8 +157,8 @@ impl Service {
             // Later server task: record a deadline and include expires_in.
             return (200, json!({"data": {"token": token}}));
         }
-        let protected =
-            matches!(path, "/texts" | "/sessions/current") || path.starts_with("/texts/");
+        let protected = matches!(path, "/texts" | "/sessions/current" | "/users/me")
+            || path.starts_with("/texts/");
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
             let mut users = self.users.lock().unwrap();
@@ -168,6 +169,10 @@ impl Service {
             let Some(name) = name else {
                 return error(401, "Login required");
             };
+            if method == "DELETE" && path == "/users/me" {
+                users.remove(&name);
+                return (200, json!({"data": null}));
+            }
             let user = users.get_mut(&name).unwrap();
             // Later server task: check expiry and keep authorization and state mutation atomic.
             if method == "DELETE" && path == "/sessions/current" {

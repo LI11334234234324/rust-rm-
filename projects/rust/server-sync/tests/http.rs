@@ -323,6 +323,10 @@ fn unimplemented_routes_are_absent() {
     let client = Client::tracked(create_app()).unwrap();
     assert_eq!(
         client.req(Method::Delete, "/users/me").dispatch().status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client.get("/unknown_route").dispatch().status(),
         Status::NotFound
     );
     for path in [
@@ -331,10 +335,152 @@ fn unimplemented_routes_are_absent() {
         "/sessions",
         "/sessions/current",
         "/texts",
+        "/users/me",
     ] {
         assert_eq!(
             client.patch(path).dispatch().status(),
             Status::MethodNotAllowed
         );
     }
+}
+
+#[test]
+fn http_user_deletion_lifecycle_and_cleanup() {
+    let client = Client::tracked(create_app()).unwrap();
+    let alice = json!({"username": "alice", "password": "password1"}).to_string();
+    let bob = json!({"username": "bob", "password": "password1"}).to_string();
+
+    // 1. 注册并登录 Alice 和 Bob
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&alice)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&bob)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+
+    let alice_login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&alice)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let alice_token = format!("Bearer {}", alice_login["data"]["token"].as_str().unwrap());
+
+    let bob_login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&bob)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let bob_token = format!("Bearer {}", bob_login["data"]["token"].as_str().unwrap());
+
+    // 2. 两人各自创建同名笔记 "shared_name"
+    let res = client
+        .put("/texts/shared_name")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "alice text"}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+
+    let res = client
+        .put("/texts/shared_name")
+        .header(Header::new("Authorization", bob_token.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "bob text"}).to_string())
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+
+    // 3. Alice 注销自己的账号
+    let del_res = client
+        .delete("/users/me")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .dispatch();
+    assert_eq!(del_res.status(), Status::Ok);
+    assert_eq!(del_res.into_json::<Value>().unwrap(), json!({"data": null}));
+
+    // 4. Alice 的旧令牌立即彻底失效（在所有受保护端点均报 401）
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .get("/texts/shared_name")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/users/me")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+
+    // 5. 隔壁租户 Bob 毫发无损
+    let bob_res = client
+        .get("/texts/shared_name")
+        .header(Header::new("Authorization", bob_token.clone()))
+        .dispatch();
+    assert_eq!(bob_res.status(), Status::Ok);
+    assert_eq!(
+        bob_res.into_json::<Value>().unwrap(),
+        json!({"data": "bob text"})
+    );
+
+    // 6. Alice 可以同名重新注册
+    let reg_again = client
+        .post("/users")
+        .header(ContentType::JSON)
+        .body(&alice)
+        .dispatch();
+    assert_eq!(reg_again.status(), Status::Created);
+
+    let new_login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&alice)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let new_alice_token = format!("Bearer {}", new_login["data"]["token"].as_str().unwrap());
+
+    // 7. 新注册的 Alice 数据白纸一张（没有历史残留）
+    let new_texts = client
+        .get("/texts")
+        .header(Header::new("Authorization", new_alice_token.clone()))
+        .dispatch();
+    assert_eq!(new_texts.status(), Status::Ok);
+    assert_eq!(new_texts.into_json::<Value>().unwrap(), json!({"data": []}));
+
+    assert_eq!(
+        client
+            .get("/texts/shared_name")
+            .header(Header::new("Authorization", new_alice_token))
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
 }
