@@ -45,3 +45,31 @@ fn concurrent_registration_has_one_winner() {
     assert_eq!(statuses.iter().filter(|&&s| s == 201).count(), 1);
     assert_eq!(statuses.iter().filter(|&&s| s == 409).count(), 3);
 }
+
+#[test]
+fn stale_login_does_not_affect_re_registed_user() {
+    let service = std::sync::Arc::new(Service::default());
+    let account = json!({"username":"alice","password":"password1"});
+    let reg = service.handle("POST", "/users", &account, "");
+    assert_eq!(reg.0, 201);
+    let login = service.handle("POST", "/sessions", &account, "");
+    assert_eq!(login.0, 200);
+    let old_auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
+
+    let service_clone = service.clone();
+    let old_account = account.clone();
+    let worker = std::thread::spawn(move || {
+        service_clone
+            .handle("POST", "/sessions", &old_account, "")
+            .0
+    });
+    let delete = service.handle("DELETE", "/users/me", &Value::Null, &old_auth);
+    assert_eq!(delete.0, 200);
+    let account1 = json!({"username":"alice","password":"password2"});
+    let reg1 = service.handle("POST", "/users", &account1, "");
+    assert_eq!(reg1.0, 201);
+    let state_status = worker.join().unwrap();
+    assert_eq!(state_status, 401);
+    let login1 = service.handle("POST", "/sessions", &account1, "");
+    assert_eq!(login1.0, 200);
+}
