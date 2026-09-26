@@ -484,3 +484,85 @@ fn http_user_deletion_lifecycle_and_cleanup() {
         Status::NotFound
     );
 }
+
+#[test]
+fn http_token_ttl_and_expiry() {
+    let service = Service::new(1);
+    let client = Client::tracked(with_service(service)).unwrap();
+    let account = json!({"username":"alice", "password":"password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    assert_eq!(login["data"]["expires_in"], 1);
+    let authorization = format!("Bearer {}", login["data"]["token"].as_str().unwrap());
+    let res = client
+        .get("/texts")
+        .header(Header::new("Authorization", authorization.clone()))
+        .dispatch();
+    assert_eq!(res.status(), Status::Ok);
+    let put_res = client
+        .put("/texts/secret")
+        .header(Header::new("Authorization", authorization.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "top secret"}).to_string())
+        .dispatch();
+    assert_eq!(put_res.status(), Status::Ok);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .get("/texts/secret")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/users/me")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    let new_login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let new_auth = format!("Bearer {}", new_login["data"]["token"].as_str().unwrap());
+
+    // 拿着新令牌读取之前存的 secret，数据完好无损！
+    let read_res = client
+        .get("/texts/secret")
+        .header(Header::new("Authorization", new_auth))
+        .dispatch();
+    assert_eq!(read_res.status(), Status::Ok);
+    assert_eq!(
+        read_res.into_json::<Value>().unwrap(),
+        json!({"data": "top secret"})
+    );
+}

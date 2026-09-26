@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant}; //引入单调时钟和时间点
 use subtle::ConstantTimeEq;
 
 pub const ROUTES: &[(&str, &str)] = &[
@@ -41,11 +42,21 @@ pub struct User {
     pub digest: [u8; 32],
     pub token: Option<String>,
     pub texts: BTreeMap<String, String>,
+    pub token_deadline: Option<Instant>,
 }
 
-#[derive(Default)]
 pub struct Service {
     pub users: Mutex<BTreeMap<String, User>>,
+    pub token_ttl_seconds: u64,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            users: Mutex::new(BTreeMap::new()),
+            token_ttl_seconds: 300,
+        }
+    }
 }
 
 pub fn error(status: u16, message: &str) -> (u16, Value) {
@@ -73,6 +84,12 @@ fn new_token() -> String {
 }
 
 impl Service {
+    pub fn new(token_ttl_seconds: u64) -> Self {
+        Self {
+            users: Mutex::new(BTreeMap::new()),
+            token_ttl_seconds,
+        }
+    }
     pub fn handle(
         &self,
         method: &str,
@@ -133,6 +150,7 @@ impl Service {
                         digest,
                         token: None,
                         texts: BTreeMap::new(),
+                        token_deadline: None,
                     },
                 );
                 return (201, json!({"data": {"username": name}}));
@@ -154,17 +172,27 @@ impl Service {
             }
             let token = new_token();
             user.token = Some(token.clone());
+            user.token_deadline =
+                Some(Instant::now() + Duration::from_secs(self.token_ttl_seconds));
             // Later server task: record a deadline and include expires_in.
-            return (200, json!({"data": {"token": token}}));
+            return (
+                200,
+                json!({"data": {"token": token, "expires_in": self.token_ttl_seconds}}),
+            );
         }
         let protected = matches!(path, "/texts" | "/sessions/current" | "/users/me")
             || path.starts_with("/texts/");
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
+            let now = Instant::now();
             let mut users = self.users.lock().unwrap();
             let name = users
                 .iter()
-                .find(|(_, user)| !token.is_empty() && user.token.as_deref() == Some(token))
+                .find(|(_, user)| {
+                    !token.is_empty()
+                        && user.token.as_deref() == Some(token)
+                        && user.token_deadline.is_some_and(|deadline| now < deadline)
+                })
                 .map(|(name, _)| name.clone());
             let Some(name) = name else {
                 return error(401, "Login required");
@@ -177,6 +205,7 @@ impl Service {
             // Later server task: check expiry and keep authorization and state mutation atomic.
             if method == "DELETE" && path == "/sessions/current" {
                 user.token = None;
+                user.token_deadline = None;
                 return (200, json!({"data": null}));
             }
             if method == "GET" && path == "/texts" {
