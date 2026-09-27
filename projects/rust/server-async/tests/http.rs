@@ -98,7 +98,10 @@ fn http_input_and_routing() {
         Status::BadRequest
     );
     assert_eq!(client.get("/missing").dispatch().status(), Status::NotFound);
-    assert_eq!(client.get("/echo").dispatch().status(), Status::NotFound);
+    assert_eq!(
+        client.get("/echo").dispatch().status(),
+        Status::MethodNotAllowed
+    );
     assert_eq!(
         client.patch("/ping").dispatch().status(),
         Status::MethodNotAllowed
@@ -110,7 +113,6 @@ fn unimplemented_routes_are_absent() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
     for (method, path) in [
-        (Method::Post, "/echo"),
         (Method::Delete, "/users/me"),
         (Method::Put, "/texts/note"),
         (Method::Get, "/texts/note"),
@@ -133,4 +135,52 @@ fn unimplemented_routes_are_absent() {
             Status::MethodNotAllowed
         );
     }
+}
+#[test]
+fn http_echo() {
+    let client = Client::tracked(create_app()).unwrap();
+    let input1 = json!({"text": "Hello\nWorld!🚀"});
+    let response1 = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(input1.to_string())
+        .dispatch();
+    assert_eq!(response1.status(), Status::Ok);
+    assert_eq!(
+        response1.into_json::<Value>().unwrap(),
+        json!({"data": "Hello\nWorld!🚀"})
+    );
+
+    let input2 = json!({"text": ""});
+    let response2 = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(input2.to_string())
+        .dispatch();
+    assert_eq!(response2.status(), Status::Ok);
+    assert_eq!(response2.into_json::<Value>().unwrap(), json!({"data": ""}));
+
+    let input3 = json!({"text": 123});
+    let response3 = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(input3.to_string())
+        .dispatch();
+    assert_eq!(response3.status(), Status::BadRequest);
+
+    let input4 = json!({"text": "a".repeat(65_537)});
+    let response4 = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(input4.to_string())
+        .dispatch();
+    assert_eq!(response4.status(), Status::PayloadTooLarge);
+
+    let input5 = json!({"text": &"a".repeat(65_536)});
+    let response5 = client
+        .post("/echo")
+        .header(ContentType::JSON)
+        .body(input5.to_string())
+        .dispatch();
+    assert_eq!(response5.status(), Status::Ok);
 }

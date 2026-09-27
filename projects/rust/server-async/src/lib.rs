@@ -14,6 +14,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/sessions"),
     ("DELETE", "/sessions/current"),
     ("GET", "/texts"),
+    ("POST", "/echo"),
 ];
 
 pub fn route_error(method: &str, path: &str) -> Option<u16> {
@@ -80,6 +81,18 @@ impl Service {
         }
         if method == "GET" && path == "/ping" {
             return (200, json!({"data": "pong"}));
+        }
+        if method == "POST" && path == "/echo" {
+            let Some(text) = body.get("text").and_then(Value::as_str) else {
+                return error(400, "Missing 'text' field");
+            };
+            if body.as_object().map(|v| v.len()) != Some(1) {
+                return error(400, "Unexpected fields in request body");
+            }
+            if text.len() > 65536 {
+                return error(413, "Text too long");
+            }
+            return (200, json!({"data": text}));
         }
         if method == "POST" && matches!(path, "/users" | "/sessions") {
             let Some(name) = body.get("username").and_then(Value::as_str) else {
