@@ -110,19 +110,11 @@ fn http_input_and_routing() {
 
 #[test]
 fn unimplemented_routes_are_absent() {
-    use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
-    for (method, path) in [
-        (Method::Delete, "/users/me"),
-        (Method::Put, "/texts/note"),
-        (Method::Get, "/texts/note"),
-        (Method::Delete, "/texts/note"),
-    ] {
-        assert_eq!(
-            client.req(method, path).dispatch().status(),
-            Status::NotFound
-        );
-    }
+    assert_eq!(
+        client.delete("/users/me").dispatch().status(),
+        Status::NotFound
+    );
     for path in [
         "/ping",
         "/users",
@@ -183,4 +175,117 @@ fn http_echo() {
         .body(input5.to_string())
         .dispatch();
     assert_eq!(response5.status(), Status::Ok);
+}
+#[test]
+fn http_text_lifecycle_and_isolation() {
+    let client = Client::tracked(create_app()).unwrap();
+    let alice = json!({"username": "alice", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .body(&alice)
+            .header(ContentType::JSON)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login1 = client
+        .post("/sessions")
+        .body(&alice)
+        .header(ContentType::JSON)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let alice_token = format!("Bearer {}", login1["data"]["token"].as_str().unwrap());
+    let put_res1 = client
+        .put("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .header(ContentType::JSON)
+        .body(json!({"text": "Hello, World!"}).to_string())
+        .dispatch();
+    assert_eq!(put_res1.status(), Status::Ok);
+    assert_eq!(
+        put_res1.into_json::<Value>().unwrap(),
+        json!({"data": null})
+    );
+    let get_res1 = client
+        .get("/texts/note")
+        .header(Header::new("Authorization", alice_token.clone()))
+        .dispatch();
+    assert_eq!(
+        get_res1.into_json::<Value>().unwrap(),
+        json!({"data": "Hello, World!"})
+    );
+    let bob = json!({"username": "bob", "password": "password2"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .body(&bob)
+            .header(ContentType::JSON)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login2 = client
+        .post("/sessions")
+        .body(&bob)
+        .header(ContentType::JSON)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let bob_token = format!("Bearer {}", login2["data"]["token"].as_str().unwrap());
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(Header::new("Authorization", bob_token.clone()))
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    assert_eq!(
+        client
+            .put("/texts/note")
+            .header(Header::new("Authorization", bob_token.clone()))
+            .header(ContentType::JSON)
+            .body(json!({"text": "Hello, Bob!"}).to_string())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .delete("/texts/note")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(Header::new("Authorization", bob_token.clone()))
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client.get("/texts/note").dispatch().status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .get("/texts/bad!name")
+            .header(Header::new("Authorization", alice_token.clone()))
+            .dispatch()
+            .status(),
+        Status::BadRequest
+    );
 }
