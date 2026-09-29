@@ -72,6 +72,16 @@ fn http_input_and_routing() {
             Status::BadRequest
         );
     }
+    // 未配对的代理码位不是合法的 JSON 字符串
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(r#"{"username":"alice","password":"\ud800"}"#)
+            .dispatch()
+            .status(),
+        Status::BadRequest
+    );
     let exact = format!("{{}}{}", " ".repeat(524_288 - 2));
     assert_eq!(
         client
