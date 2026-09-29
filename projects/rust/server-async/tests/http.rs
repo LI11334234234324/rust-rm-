@@ -1,7 +1,10 @@
 use rm_server_async::http::create_app;
+use rm_server_async::{Service, http::with_service};
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::blocking::Client;
 use serde_json::{Value, json};
+use std::thread::sleep;
+use std::time::Duration;
 
 #[test]
 fn http_account_lifecycle() {
@@ -409,5 +412,105 @@ fn http_user_deletion_lifecycle_and_cleanup() {
             .dispatch()
             .status(),
         Status::NotFound
+    );
+}
+#[test]
+fn http_token_ttl_and_expiry() {
+    let service = Service::new(1);
+    let client = Client::tracked(with_service(service)).unwrap();
+    let alice = json!({"username": "alice", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .body(&alice)
+            .header(ContentType::JSON)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login = client
+        .post("/sessions")
+        .body(&alice)
+        .header(ContentType::JSON)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    assert_eq!(login["data"]["expires_in"], 1);
+    let authorization = format!("Bearer {}", login["data"]["token"].as_str().unwrap());
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .put("/texts/secret")
+            .header(Header::new("Authorization", authorization.clone()))
+            .header(ContentType::JSON)
+            .body(json!({"text": "alice text"}).to_string())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    sleep(Duration::from_millis(1100));
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .get("/texts/secret")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/texts/secret")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/users/me")
+            .header(Header::new("Authorization", authorization.clone()))
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    let login2 = client
+        .post("/sessions")
+        .body(&alice)
+        .header(ContentType::JSON)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let authorization2 = format!("Bearer {}", login2["data"]["token"].as_str().unwrap());
+    assert_eq!(
+        client
+            .get("/texts/secret")
+            .header(Header::new("Authorization", authorization2.clone()))
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    let get_res = client
+        .get("/texts/secret")
+        .header(Header::new("Authorization", authorization2))
+        .dispatch();
+    assert_eq!(get_res.status(), Status::Ok);
+    assert_eq!(
+        get_res.into_json::<Value>().unwrap(),
+        json!({"data": "alice text"})
     );
 }
