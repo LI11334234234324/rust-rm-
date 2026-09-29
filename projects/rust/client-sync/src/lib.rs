@@ -2,6 +2,15 @@ use reqwest::{Method, blocking::Client};
 use serde_json::{Value, json};
 use std::io::BufRead;
 
+/// 读取一段多行文本，直到单独一行的 `.` 为止。
+///
+/// 输入约定：
+/// - 单独一行的 `.` 结束输入，不计入正文；一上来就输入 `.` 表示空文本。
+/// - 正文最后多打一个空行表示结尾换行：`hello`、空行、`.` 得到 `"hello\n"`；
+///   整段都是空行时空行数即换行数，空行、`.` 得到 `"\n"`。
+/// - 以 `..` 开头的行脱去一个点，所以输入 `..` 得到 `"."`、输入 `...x` 得到
+///   `"..x"`；其他行原样保留，`.env` 就是 `.env`。
+/// - 输入结束（EOF）同样结束输入。
 pub fn read_text<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     let mut lines = Vec::new();
     loop {
@@ -15,14 +24,20 @@ pub fn read_text<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
             break;
         }
 
-        let content = if let Some(stripped) = trimmed.strip_prefix(".") {
-            stripped
+        // 以 ".." 开头的行只去掉第一个点，字面量 "." 因此写成 ".."
+        let content = if trimmed.starts_with("..") {
+            &trimmed[1..]
         } else {
             trimmed
         };
         lines.push(content.to_string());
     }
-    Ok(lines.join("\n"))
+
+    if lines.iter().all(|s| s.is_empty()) {
+        Ok("\n".repeat(lines.len()))
+    } else {
+        Ok(lines.join("\n"))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -225,6 +240,18 @@ mod tests {
     }
 
     #[test]
+    fn reads_single_newline() {
+        let mut input = Cursor::new("\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), "\n");
+    }
+
+    #[test]
+    fn reads_two_newlines() {
+        let mut input = Cursor::new("\n\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), "\n\n");
+    }
+
+    #[test]
     fn reads_dot_as_body_line() {
         // 输入 ".." 应该被脱壳为 "." 作为正文
         let mut input = Cursor::new("first\n..\nlast\n.\n");
@@ -232,10 +259,63 @@ mod tests {
     }
 
     #[test]
+    fn reads_single_escaped_dot_line() {
+        let mut input = Cursor::new("..\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), ".");
+    }
+
+    #[test]
+    fn preserves_dot_prefixed_regular_lines() {
+        // 只有以 ".." 开头的行才脱壳，普通隐藏文件名原样保留
+        let mut input = Cursor::new(".env\n.gitignore\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), ".env\n.gitignore");
+    }
+
+    #[test]
+    fn unescapes_doubled_dot_prefixes() {
+        // 字面量 ".." 仍然可以表达：多打一个点
+        let mut input = Cursor::new("..gitignore\n...\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), ".gitignore\n..");
+    }
+
+    #[test]
     fn preserves_trailing_newline() {
         // 在 "." 前面敲空行，应该保留末尾换行
         let mut input = Cursor::new("hello\n\n.\n");
         assert_eq!(read_text(&mut input).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn reads_multiline_without_trailing_newline() {
+        let mut input = Cursor::new("hello\nworld\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), "hello\nworld");
+    }
+
+    #[test]
+    fn reads_multiline_with_trailing_newline() {
+        let mut input = Cursor::new("hello\nworld\n\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn reads_until_eof_without_dot() {
+        let mut input = Cursor::new("line1\nline2");
+        assert_eq!(read_text(&mut input).unwrap(), "line1\nline2");
+    }
+
+    #[test]
+    fn handles_crlf_line_endings() {
+        let mut input = Cursor::new("hello\r\n..\r\nworld\r\n.\r\n");
+        assert_eq!(read_text(&mut input).unwrap(), "hello\n.\nworld");
+    }
+
+    #[test]
+    fn handles_crlf_empty_and_trailing_newlines() {
+        let mut input = Cursor::new("\r\n.\r\n");
+        assert_eq!(read_text(&mut input).unwrap(), "\n");
+
+        let mut input2 = Cursor::new("hello\r\n\r\n.\r\n");
+        assert_eq!(read_text(&mut input2).unwrap(), "hello\n");
     }
 
     #[test]
