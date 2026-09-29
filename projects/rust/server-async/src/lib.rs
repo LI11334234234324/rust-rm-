@@ -36,12 +36,60 @@ pub fn route_error(method: &str, path: &str) -> Option<u16> {
     }
 }
 
+#[derive(Clone)]
+pub struct Session {
+    pub token: String,
+    pub deadline: Instant,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("token", &"<redacted>")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+impl Session {
+    pub fn is_valid(&self, token: &str, now: Instant) -> bool {
+        !token.is_empty() && self.token == token && now < self.deadline
+    }
+}
+
 pub struct User {
     pub salt: [u8; 16],
     pub digest: [u8; 32],
-    pub token: Option<String>,
+    pub session: Option<Session>,
     pub texts: BTreeMap<String, String>,
-    pub token_deadline: Option<Instant>,
+}
+
+impl User {
+    pub fn new(salt: [u8; 16], digest: [u8; 32]) -> Self {
+        Self {
+            salt,
+            digest,
+            session: None,
+            texts: BTreeMap::new(),
+        }
+    }
+
+    pub fn start_session(&mut self, token: String, ttl: Duration) {
+        self.session = Some(Session {
+            token,
+            deadline: Instant::now() + ttl,
+        });
+    }
+
+    pub fn clear_session(&mut self) {
+        self.session = None;
+    }
+
+    pub fn has_valid_token(&self, token: &str, now: Instant) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.is_valid(token, now))
+    }
 }
 
 pub struct Service {
@@ -61,15 +109,72 @@ impl Service {
 
 impl Default for Service {
     fn default() -> Self {
-        Self {
-            users: Mutex::new(BTreeMap::new()),
-            token_ttl_seconds: 300,
+        Self::new(300)
+    }
+}
+
+/// 登录前读取的凭据快照。
+///
+/// 把"读取凭据"和"提交令牌"分成两步，并发场景才可断言：读取快照之后账号
+/// 可能被注销并同名重注册，此时必须拒绝用旧快照提交令牌。
+#[derive(Clone, Copy)]
+pub struct Credentials {
+    salt: [u8; 16],
+    digest: [u8; 32],
+}
+
+impl Service {
+    /// 读取用户当前的凭据快照；用户名不存在时返回 `None`。
+    pub fn read_credentials(&self, name: &str) -> Option<Credentials> {
+        let users = self.users.lock().unwrap();
+        users.get(name).map(|user| Credentials {
+            salt: user.salt,
+            digest: user.digest,
+        })
+    }
+
+    /// 用 `read_credentials` 取得的快照校验密码并签发新令牌。
+    ///
+    /// 快照已经失效时（例如账号在读取后被注销并同名重注册）返回 401，
+    /// 不会把令牌签发给新的同名账号。
+    pub fn login_with(
+        &self,
+        name: &str,
+        password: &str,
+        credentials: &Credentials,
+    ) -> (u16, Value) {
+        let digest = password_hash(password, &credentials.salt);
+        let mut users = self.users.lock().unwrap();
+        let Some(user) = users.get_mut(name) else {
+            return error(401, "Invalid username or password");
+        };
+        if user.salt != credentials.salt || !bool::from(digest.ct_eq(&credentials.digest)) {
+            return error(401, "Invalid username or password");
         }
+        let token = new_token();
+        user.start_session(token.clone(), Duration::from_secs(self.token_ttl_seconds));
+        (
+            200,
+            json!({"data": {"token": token, "expires_in": self.token_ttl_seconds}}),
+        )
     }
 }
 
 pub fn error(status: u16, message: &str) -> (u16, Value) {
     (status, json!({"message": message}))
+}
+
+pub(crate) fn extract_text_field(body: &Value) -> Result<&str, (u16, Value)> {
+    let Some(text) = body.get("text").and_then(Value::as_str) else {
+        return Err(error(400, "Expected text"));
+    };
+    if body.as_object().map(|v| v.len()) != Some(1) {
+        return Err(error(400, "Invalid fields"));
+    }
+    if text.len() > 65_536 {
+        return Err(error(413, "Text too large"));
+    }
+    Ok(text)
 }
 
 pub fn valid_name(name: &str, max: usize) -> bool {
@@ -114,15 +219,10 @@ impl Service {
             return (200, json!({"data": "pong"}));
         }
         if method == "POST" && path == "/echo" {
-            let Some(text) = body.get("text").and_then(Value::as_str) else {
-                return error(400, "Missing 'text' field");
+            let text = match extract_text_field(body) {
+                Ok(text) => text,
+                Err(err) => return err,
             };
-            if body.as_object().map(|v| v.len()) != Some(1) {
-                return error(400, "Unexpected fields in request body");
-            }
-            if text.len() > 65536 {
-                return error(413, "Text too long");
-            }
             return (200, json!({"data": text}));
         }
         if method == "POST" && matches!(path, "/users" | "/sessions") {
@@ -146,56 +246,23 @@ impl Service {
                 if users.contains_key(name) {
                     return error(409, "Username exists");
                 }
-                users.insert(
-                    name.into(),
-                    User {
-                        salt,
-                        digest,
-                        token: None,
-                        texts: BTreeMap::new(),
-                        token_deadline: None,
-                    },
-                );
+                users.insert(name.into(), User::new(salt, digest));
                 return (201, json!({"data": {"username": name}}));
             }
-            let (salt, expected) = {
-                let users = self.users.lock().unwrap();
-                let Some(user) = users.get(name) else {
-                    return error(401, "Invalid username or password");
-                };
-                (user.salt, user.digest)
-            };
-            let digest = password_hash(password, &salt);
-            let mut users = self.users.lock().unwrap();
-            let Some(user) = users.get_mut(name) else {
+            let Some(credentials) = self.read_credentials(name) else {
                 return error(401, "Invalid username or password");
             };
-            if user.salt != salt || !bool::from(digest.ct_eq(&expected)) {
-                return error(401, "Invalid username or password");
-            }
-            let token = new_token();
-            user.token = Some(token.clone());
-            user.token_deadline =
-                Some(Instant::now() + Duration::from_secs(self.token_ttl_seconds));
-            // Later server task: record a deadline and include expires_in.
-            return (
-                200,
-                json!({"data": {"token": token, "expires_in": self.token_ttl_seconds}}),
-            );
+            return self.login_with(name, password, &credentials);
         }
         let protected = matches!(path, "/texts" | "/sessions/current" | "/users/me")
-            || path.starts_with("/texts/"); //鉴权
+            || path.starts_with("/texts/");
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
             let now = Instant::now();
             let mut users = self.users.lock().unwrap();
             let name = users
                 .iter()
-                .find(|(_, user)| {
-                    !token.is_empty()
-                        && user.token.as_deref() == Some(token)
-                        && user.token_deadline.is_some_and(|deadline| now < deadline)
-                })
+                .find(|(_, user)| user.has_valid_token(token, now))
                 .map(|(name, _)| name.clone());
             let Some(name) = name else {
                 return error(401, "Login required");
@@ -203,12 +270,10 @@ impl Service {
             if method == "DELETE" && path == "/users/me" {
                 users.remove(&name);
                 return (200, json!({"data": null}));
-            } //  在拿到 Some(name) 之后、获取 user可变借用之前，直接拦截处理注销并返回
+            }
             let user = users.get_mut(&name).unwrap();
-            // Later server task: check expiry and keep authorization and state mutation atomic.
             if method == "DELETE" && path == "/sessions/current" {
-                user.token = None;
-                user.token_deadline = None;
+                user.clear_session();
                 return (200, json!({"data": null}));
             }
             if method == "GET" && path == "/texts" {
@@ -226,15 +291,10 @@ impl Service {
                     }
                 }
                 if method == "PUT" {
-                    let Some(text) = body.get("text").and_then(Value::as_str) else {
-                        return error(400, "Expected text");
+                    let text = match extract_text_field(body) {
+                        Ok(text) => text,
+                        Err(err) => return err,
                     };
-                    if body.as_object().map(|v| v.len()) != Some(1) {
-                        return error(400, "Invalid fields");
-                    }
-                    if text.len() > 65536 {
-                        return error(413, "Text too large");
-                    }
                     user.texts.insert(text_name.to_owned(), text.to_owned());
                     return (200, json!({"data": null}));
                 }
