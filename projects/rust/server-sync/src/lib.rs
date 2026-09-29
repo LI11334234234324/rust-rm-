@@ -85,6 +85,7 @@ fn new_token() -> String {
 
 impl Service {
     pub fn new(token_ttl_seconds: u64) -> Self {
+        assert!(token_ttl_seconds > 0, "token_ttl_seconds must be positive");
         Self {
             users: Mutex::new(BTreeMap::new()),
             token_ttl_seconds,
