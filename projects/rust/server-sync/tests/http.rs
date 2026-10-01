@@ -328,7 +328,7 @@ fn http_text_lifecycle_and_isolation() {
 }
 
 #[test]
-fn unimplemented_routes_are_absent() {
+fn missing_token_401_and_wrong_method_405() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
     assert_eq!(
@@ -497,7 +497,7 @@ fn http_user_deletion_lifecycle_and_cleanup() {
 
 #[test]
 fn http_token_ttl_and_expiry() {
-    let service = Service::new(1);
+    let service = Service::new(2);
     let client = Client::tracked(with_service(service)).unwrap();
     let account = json!({"username":"alice", "password":"password1"}).to_string();
     assert_eq!(
@@ -516,7 +516,7 @@ fn http_token_ttl_and_expiry() {
         .dispatch()
         .into_json::<Value>()
         .unwrap();
-    assert_eq!(login["data"]["expires_in"], 1);
+    assert_eq!(login["data"]["expires_in"], 2);
     let authorization = format!("Bearer {}", login["data"]["token"].as_str().unwrap());
     let res = client
         .get("/texts")
@@ -531,7 +531,7 @@ fn http_token_ttl_and_expiry() {
         .dispatch();
     assert_eq!(put_res.status(), Status::Ok);
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     assert_eq!(
         client
             .get("/texts")

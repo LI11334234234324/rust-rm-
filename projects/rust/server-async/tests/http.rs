@@ -122,7 +122,7 @@ fn http_input_and_routing() {
 }
 
 #[test]
-fn unimplemented_routes_are_absent() {
+fn missing_token_401_and_wrong_method_405() {
     let client = Client::tracked(create_app()).unwrap();
     assert_eq!(
         client.delete("/users/me").dispatch().status(),
@@ -426,7 +426,7 @@ fn http_user_deletion_lifecycle_and_cleanup() {
 }
 #[test]
 fn http_token_ttl_and_expiry() {
-    let service = Service::new(1);
+    let service = Service::new(2);
     let client = Client::tracked(with_service(service)).unwrap();
     let alice = json!({"username": "alice", "password": "password1"}).to_string();
     assert_eq!(
@@ -445,7 +445,7 @@ fn http_token_ttl_and_expiry() {
         .dispatch()
         .into_json::<Value>()
         .unwrap();
-    assert_eq!(login["data"]["expires_in"], 1);
+    assert_eq!(login["data"]["expires_in"], 2);
     let authorization = format!("Bearer {}", login["data"]["token"].as_str().unwrap());
     assert_eq!(
         client
@@ -465,7 +465,7 @@ fn http_token_ttl_and_expiry() {
             .status(),
         Status::Ok
     );
-    sleep(Duration::from_millis(1100));
+    sleep(Duration::from_millis(2100));
     assert_eq!(
         client
             .get("/texts")
