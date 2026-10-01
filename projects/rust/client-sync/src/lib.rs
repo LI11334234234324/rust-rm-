@@ -106,7 +106,7 @@ pub fn build_echo_request(text: &str) -> RequestSpec {
 pub fn build_put_request(name: &str, text: &str) -> RequestSpec {
     RequestSpec {
         method: Method::PUT,
-        path: format!("/texts/{name}"),
+        path: format!("/texts/{}", encode_path_segment(name)),
         body: Some(json!({
             "text": text
         })),
@@ -116,7 +116,7 @@ pub fn build_put_request(name: &str, text: &str) -> RequestSpec {
 pub fn build_get_request(name: &str) -> RequestSpec {
     RequestSpec {
         method: Method::GET,
-        path: format!("/texts/{name}"),
+        path: format!("/texts/{}", encode_path_segment(name)),
         body: None,
     }
 }
@@ -124,7 +124,7 @@ pub fn build_get_request(name: &str) -> RequestSpec {
 pub fn build_delete_request(name: &str) -> RequestSpec {
     RequestSpec {
         method: Method::DELETE,
-        path: format!("/texts/{name}"),
+        path: format!("/texts/{}", encode_path_segment(name)),
         body: None,
     }
 }
@@ -189,7 +189,7 @@ pub enum ResponseEffect {
 }
 
 pub fn handle_response(command: Command, status: u16, value: &Value) -> ResponseEffect {
-    if status == 401 {
+    if status == 401 && command != Command::Login {
         return ResponseEffect::RequireRelogin;
     }
     if status == 200 && matches!(command, Command::Logout | Command::DeleteUser) {
@@ -226,6 +226,32 @@ pub fn exchange(
     let value =
         serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"message": text}));
     Ok((status, value))
+}
+
+/// 把一个文本名编码成 URL 路径段。
+///
+/// 名字是直接拼进请求路径的，不编码就会改变请求的目标：`a?b` 被当成"路径 `/texts/a`
+/// 加查询串 `b`"，`a#b` 的 `#b` 被当成片段丢掉，`a\b` 被 URL 规范归一成 `a/b`，
+/// `%41` 到服务端会被当成另一个名字。于是 `put a#b` 会打印 200，写进去的却是 `a`
+/// ——静默写到另一个文本上。
+///
+/// 规则：只有协议允许的名字字符（`A-Z a-z 0-9 _ -`）原样保留，其余字节一律百分号
+/// 编码。合法名字因此完全不受影响；非法名字会原样送到服务端，由服务端判 400
+/// （客户端不替服务端做字段校验）。
+///
+/// 残留一处：名字恰好是 `.` 或 `..` 时，URL 规范把它们的任何写法（含 `%2E`）都当
+/// 点段消除，请求最终落到 `/texts/` 或 `/` 上（服务端 404）。两者都不是合法名字，
+/// 也不会碰到别的文本，所以这里只记一笔，不做本地特判。
+fn encode_path_segment(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -465,5 +491,45 @@ mod tests {
             handle_response(Command::Put, 413, &json!({"message": "too large"})),
             ResponseEffect::Nothing
         );
+    }
+
+    #[test]
+    fn a_failed_login_does_not_discard_a_valid_token() {
+        // 回归：401 一律判成 RequireRelogin，于是"用错密码再登录一次"会把当前
+        // 有效的令牌清掉——服务端只对**成功**的登录替换令牌，旧令牌仍然有效。
+        assert_eq!(
+            handle_response(
+                Command::Login,
+                401,
+                &json!({"message": "Invalid username or password"})
+            ),
+            ResponseEffect::Nothing
+        );
+        // 受保护请求上的 401 仍然要求重新登录
+        assert_eq!(
+            handle_response(Command::List, 401, &Value::Null),
+            ResponseEffect::RequireRelogin
+        );
+    }
+
+    #[test]
+    fn text_names_are_encoded_so_they_cannot_retarget_another_text() {
+        // 回归：URL 结构字符曾原样进入路径，`put a?b` 会写到 `a` 上（200 却改了别的文本）
+        assert_eq!(build_put_request("a?b", "x").path, "/texts/a%3Fb");
+        assert_eq!(build_get_request("a#b").path, "/texts/a%23b");
+        assert_eq!(build_delete_request("a\\b").path, "/texts/a%5Cb");
+        assert_eq!(build_get_request("a/b").path, "/texts/a%2Fb");
+        assert_eq!(build_put_request("a b", "x").path, "/texts/a%20b");
+        // 百分号本身也要编码，否则服务端的解码结果会和你输入的不一致
+        assert_eq!(build_get_request("%41").path, "/texts/%2541");
+        // `..` 在 builder 这一层是编码好的；但 URL 规范会把点段的任何写法消除，
+        // 所以真正发出的路径是 `/`（见 `encode_path_segment` 的"残留一处"）
+        assert_eq!(build_delete_request("..").path, "/texts/%2E%2E");
+        // 非 ASCII 名字按字节编码
+        assert_eq!(build_get_request("名").path, "/texts/%E5%90%8D");
+        // 协议允许的名字不受影响
+        for name in ["note", "note-1_2", "ABC"] {
+            assert_eq!(build_put_request(name, "x").path, format!("/texts/{name}"));
+        }
     }
 }
