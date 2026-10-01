@@ -434,3 +434,87 @@ fn password_length_counts_unicode_scalar_values() {
     let over = json!({"username":"carol","password":"a".repeat(129)});
     assert_eq!(service.handle("POST", "/users", &over, "").0, 400);
 }
+
+#[test]
+fn absurd_token_ttl_is_clamped_instead_of_poisoning_the_service() {
+    // 回归：`--token-ttl-seconds` 原来只挡 0，u64::MAX 会让 `Instant::now() + ttl`
+    // 在登录时溢出 panic。panic 落在持有 users 锁的临界区里，会把互斥锁毒化，
+    // 之后每个触及状态的请求都 500（只有不碰锁的 /ping 还活着，进程也不退出）。
+    let service = Service::new(u64::MAX);
+    assert_eq!(service.token_ttl_seconds, 365 * 24 * 60 * 60);
+
+    let account = json!({"username":"alice","password":"password1"});
+    assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
+    let login = service.handle("POST", "/sessions", &account, "");
+    assert_eq!(login.0, 200);
+    // `expires_in` 报的是钳过之后的值，与真实 deadline 一致
+    assert_eq!(login.1["data"]["expires_in"], json!(365 * 24 * 60 * 60));
+    assert_eq!(login.1["data"]["token"].as_str().unwrap().len(), 64);
+
+    let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
+    assert_eq!(
+        service.handle("GET", "/texts", &Value::Null, &auth),
+        (200, json!({"data": []}))
+    );
+    // 锁没有被毒化：后续注册和登录仍然正常
+    let bob = json!({"username":"bob","password":"password1"});
+    assert_eq!(service.handle("POST", "/users", &bob, "").0, 201);
+    assert_eq!(service.handle("POST", "/sessions", &bob, "").0, 200);
+}
+
+#[test]
+fn a_poisoned_lock_does_not_brick_the_service() {
+    // 回归：4 处 `.lock().unwrap()` 会把"一次 panic"升级成"此后每个触及状态的请求
+    // 都 500"——互斥锁中毒不会自愈，进程却还活着。现在用 `into_inner` 恢复。
+    let service = Service::default();
+    let account = json!({"username":"alice","password":"password1"});
+    assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = service.users.lock().unwrap();
+        panic!("simulated handler panic while holding the users lock");
+    }));
+    std::panic::set_hook(previous_hook);
+
+    assert!(panicked.is_err());
+    assert!(service.users.is_poisoned());
+    assert_eq!(service.handle("POST", "/sessions", &account, "").0, 200);
+    let login = service.handle("POST", "/sessions", &account, "");
+    let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
+    assert_eq!(
+        service.handle("GET", "/texts", &Value::Null, &auth),
+        (200, json!({"data": []}))
+    );
+}
+
+#[test]
+fn a_token_that_expires_while_waiting_for_the_lock_is_rejected() {
+    // 回归：`now` 原来在拿锁之前取，等锁跨过 deadline 时本应失效的令牌仍被接受。
+    let service = std::sync::Arc::new(Service::new(1));
+    let account = json!({"username":"alice","password":"password1"});
+    assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
+    let login = service.handle("POST", "/sessions", &account, "");
+    assert_eq!(login.0, 200);
+    let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
+
+    // 占住锁 1.2 秒（超过 1 秒有效期），请求只能在锁外排队
+    let holder_service = service.clone();
+    let (locked, is_locked) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = holder_service.users.lock().unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    });
+    is_locked.recv().unwrap();
+
+    let request_service = service.clone();
+    let request = std::thread::spawn(move || {
+        request_service
+            .handle("GET", "/texts", &Value::Null, &auth)
+            .0
+    });
+    assert_eq!(request.join().unwrap(), 401);
+    holder.join().unwrap();
+}

@@ -54,7 +54,7 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     pub fn is_valid(&self, token: &str, now: Instant) -> bool {
-        !token.is_empty() && self.token == token && now < self.deadline
+        bool::from(self.token.as_bytes().ct_eq(token.as_bytes())) && now < self.deadline
     }
 }
 
@@ -78,7 +78,7 @@ impl User {
     pub fn start_session(&mut self, token: String, ttl: Duration) {
         self.session = Some(Session {
             token,
-            deadline: Instant::now() + ttl,
+            deadline: Instant::now() + ttl.min(Duration::from_secs(365 * 24 * 60 * 60)),
         });
     }
 
@@ -103,7 +103,7 @@ impl Service {
         assert!(token_ttl_seconds > 0, "token_ttl_seconds must be positive");
         Self {
             users: Mutex::new(BTreeMap::new()),
-            token_ttl_seconds,
+            token_ttl_seconds: token_ttl_seconds.min(365 * 24 * 60 * 60),
         }
     }
 }
@@ -127,7 +127,7 @@ pub struct Credentials {
 impl Service {
     /// 读取用户当前的凭据快照；用户名不存在时返回 `None`。
     pub fn read_credentials(&self, name: &str) -> Option<Credentials> {
-        let users = self.users.lock().unwrap();
+        let users = self.users.lock().unwrap_or_else(|e| e.into_inner());
         users.get(name).map(|user| Credentials {
             salt: user.salt,
             digest: user.digest,
@@ -145,7 +145,7 @@ impl Service {
         credentials: &Credentials,
     ) -> (u16, Value) {
         let digest = password_hash(password, &credentials.salt);
-        let mut users = self.users.lock().unwrap();
+        let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
         let Some(user) = users.get_mut(name) else {
             return error(401, "Invalid username or password");
         };
@@ -243,7 +243,7 @@ impl Service {
                 let mut salt = [0; 16];
                 OsRng.fill_bytes(&mut salt);
                 let digest = password_hash(password, &salt);
-                let mut users = self.users.lock().unwrap();
+                let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
                 if users.contains_key(name) {
                     return error(409, "Username exists");
                 }
@@ -259,8 +259,8 @@ impl Service {
             || path.starts_with("/texts/");
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
+            let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            let mut users = self.users.lock().unwrap();
             let name = users
                 .iter()
                 .find(|(_, user)| user.has_valid_token(token, now))
