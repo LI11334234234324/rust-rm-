@@ -1,3 +1,6 @@
+mod common;
+
+use common::ManualClock;
 use rm_server_sync::{
     Service,
     http::{create_app, with_service},
@@ -5,6 +8,8 @@ use rm_server_sync::{
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::blocking::Client;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[test]
 fn app_uses_supplied_service() {
@@ -497,7 +502,8 @@ fn http_user_deletion_lifecycle_and_cleanup() {
 
 #[test]
 fn http_token_ttl_and_expiry() {
-    let service = Service::new(2);
+    let clock = Arc::new(ManualClock::new(Instant::now()));
+    let service = Service::with_clock(2, Box::new(clock.clone()));
     let client = Client::tracked(with_service(service)).unwrap();
     let account = json!({"username":"alice", "password":"password1"}).to_string();
     assert_eq!(
@@ -531,7 +537,7 @@ fn http_token_ttl_and_expiry() {
         .dispatch();
     assert_eq!(put_res.status(), Status::Ok);
 
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    clock.advance(Duration::from_secs(3));
     assert_eq!(
         client
             .get("/texts")

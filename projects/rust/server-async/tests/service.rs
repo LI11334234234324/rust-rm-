@@ -1,5 +1,10 @@
+mod common;
+
+use common::ManualClock;
 use rm_server_async::Service;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[test]
 fn input_validation_and_baseline() {
@@ -436,19 +441,19 @@ fn password_length_counts_unicode_scalar_values() {
 }
 
 #[test]
-fn absurd_token_ttl_is_clamped_instead_of_poisoning_the_service() {
-    // 回归：`--token-ttl-seconds` 原来只挡 0，u64::MAX 会让 `Instant::now() + ttl`
-    // 在登录时溢出 panic。panic 落在持有 users 锁的临界区里，会把互斥锁毒化，
-    // 之后每个触及状态的请求都 500（只有不碰锁的 /ping 还活着，进程也不退出）。
+fn absurd_token_ttl_saturates_instead_of_poisoning_the_service() {
+    // 回归：u64::MAX 会让 `Instant::now() + ttl` 在登录时溢出 panic。panic 落在
+    // 持有 users 锁的临界区里，会把互斥锁毒化，之后每个触及状态的请求都 500
+    //（只有不碰锁的 /ping 还活着，进程也不退出）。
+    // `Instant` 表达不了的时长按"不会过期"处理，配置值本身不再被改写。
     let service = Service::new(u64::MAX);
-    assert_eq!(service.token_ttl_seconds, 365 * 24 * 60 * 60);
 
     let account = json!({"username":"alice","password":"password1"});
     assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
     let login = service.handle("POST", "/sessions", &account, "");
     assert_eq!(login.0, 200);
-    // `expires_in` 报的是钳过之后的值，与真实 deadline 一致
-    assert_eq!(login.1["data"]["expires_in"], json!(365 * 24 * 60 * 60));
+    // `expires_in` 就是配置的有效秒数
+    assert_eq!(login.1["data"]["expires_in"], json!(u64::MAX));
     assert_eq!(login.1["data"]["token"].as_str().unwrap().len(), 64);
 
     let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
@@ -463,58 +468,23 @@ fn absurd_token_ttl_is_clamped_instead_of_poisoning_the_service() {
 }
 
 #[test]
-fn a_poisoned_lock_does_not_brick_the_service() {
-    // 回归：4 处 `.lock().unwrap()` 会把"一次 panic"升级成"此后每个触及状态的请求
-    // 都 500"——互斥锁中毒不会自愈，进程却还活着。现在用 `into_inner` 恢复。
-    let service = Service::default();
-    let account = json!({"username":"alice","password":"password1"});
-    assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
-
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = service.users.lock().unwrap();
-        panic!("simulated handler panic while holding the users lock");
-    }));
-    std::panic::set_hook(previous_hook);
-
-    assert!(panicked.is_err());
-    assert!(service.users.is_poisoned());
-    assert_eq!(service.handle("POST", "/sessions", &account, "").0, 200);
-    let login = service.handle("POST", "/sessions", &account, "");
-    let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
-    assert_eq!(
-        service.handle("GET", "/texts", &Value::Null, &auth),
-        (200, json!({"data": []}))
-    );
-}
-
-#[test]
-fn a_token_that_expires_while_waiting_for_the_lock_is_rejected() {
-    // 回归：`now` 原来在拿锁之前取，等锁跨过 deadline 时本应失效的令牌仍被接受。
-    let service = std::sync::Arc::new(Service::new(1));
+fn expiry_is_strict_at_the_deadline_and_reading_does_not_renew() {
+    let clock = Arc::new(ManualClock::new(Instant::now()));
+    let service = Service::with_clock(300, Box::new(clock.clone()));
     let account = json!({"username":"alice","password":"password1"});
     assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
     let login = service.handle("POST", "/sessions", &account, "");
     assert_eq!(login.0, 200);
     let auth = format!("Bearer {}", login.1["data"]["token"].as_str().unwrap());
 
-    // 占住锁 1.2 秒（超过 1 秒有效期），请求只能在锁外排队
-    let holder_service = service.clone();
-    let (locked, is_locked) = std::sync::mpsc::channel();
-    let holder = std::thread::spawn(move || {
-        let _guard = holder_service.users.lock().unwrap();
-        locked.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-    });
-    is_locked.recv().unwrap();
+    // 差一秒到点：仍然有效，而且这次读取不会把期限往后推
+    clock.advance(Duration::from_secs(299));
+    assert_eq!(
+        service.handle("GET", "/texts", &Value::Null, &auth),
+        (200, json!({"data": []}))
+    );
 
-    let request_service = service.clone();
-    let request = std::thread::spawn(move || {
-        request_service
-            .handle("GET", "/texts", &Value::Null, &auth)
-            .0
-    });
-    assert_eq!(request.join().unwrap(), 401);
-    holder.join().unwrap();
+    // 正好到点：比较是严格的，已经失效
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
 }

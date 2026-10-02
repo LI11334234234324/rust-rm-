@@ -25,8 +25,8 @@ impl Fairing for ConsoleOutput {
         eprintln!("Listening on http://{address}");
         eprintln!("Press Ctrl+C to exit. All in-memory data is lost on exit.");
         eprintln!("Routes:");
-        for (method, path) in ROUTES.iter().chain(TEXT_NAME_ROUTES) {
-            eprintln!("  {method} {path}");
+        for route in ROUTES {
+            eprintln!("  {} {}", route.method, route.path);
         }
     }
 
@@ -125,14 +125,6 @@ impl Handler for Dispatch {
         Outcome::from(request, (Status::new(status), Json(body)))
     }
 }
-
-/// 只给启动横幅用的通配路径：`ROUTES` 是精确匹配表，装不下 `/texts/{name}` 这一族。
-/// 真正的 404/405 判定在 `route_error` 与 `Service::handle` 里，这里只影响打印。
-const TEXT_NAME_ROUTES: &[(&str, &str)] = &[
-    ("PUT", "/texts/{name}"),
-    ("GET", "/texts/{name}"),
-    ("DELETE", "/texts/{name}"),
-];
 
 pub fn create_app() -> Rocket<Build> {
     with_service(Service::default())
