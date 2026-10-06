@@ -6,9 +6,7 @@ use std::net::SocketAddr;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7878")]
     address: SocketAddr,
-    // 上界一年：再大的取值会让 `Instant::now() + ttl` 在登录时溢出 panic，而那个
-    // panic 发生在持有 users 锁的临界区里，会把互斥锁毒化。
-    #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(1..=365 * 24 * 60 * 60))]
+    #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
     token_ttl_seconds: u64,
 }
 
@@ -24,4 +22,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(("log_level", "critical"));
     app.configure(config).launch().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn token_ttl_defaults_to_300_seconds() {
+        let args = Args::try_parse_from(["server"]).unwrap();
+        assert_eq!(args.token_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn token_ttl_accepts_positive_u64_values() {
+        for ttl in [1, 31_536_000, 31_536_001, u64::MAX] {
+            let value = ttl.to_string();
+            let args = Args::try_parse_from(["server", "--token-ttl-seconds", &value]).unwrap();
+            assert_eq!(args.token_ttl_seconds, ttl);
+        }
+    }
+
+    #[test]
+    fn token_ttl_rejects_invalid_values() {
+        for value in ["0", "-1", "1.5", "invalid", "18446744073709551616"] {
+            assert!(Args::try_parse_from(["server", "--token-ttl-seconds", value]).is_err());
+        }
+    }
 }
