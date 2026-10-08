@@ -8,8 +8,9 @@ use std::io::BufRead;
 /// - 单独一行的 `.` 结束输入，不计入正文；一上来就输入 `.` 表示空文本。
 /// - 正文最后多打一个空行表示结尾换行：`hello`、空行、`.` 得到 `"hello\n"`；
 ///   整段都是空行时空行数即换行数，空行、`.` 得到 `"\n"`。
-/// - 以 `..` 开头的行脱去一个点，所以输入 `..` 得到 `"."`、输入 `...x` 得到
-///   `"..x"`；其他行原样保留，`.env` 就是 `.env`。
+/// - 除结束标记外，以 `.` 开头的行去掉一个点。正文行以点开头时，输入时额外
+///   加一个点：`..` 得到 `"."`、`..env` 得到 `".env"`、`...x` 得到 `"..x"`。
+///   其他行原样保留，正文中间的点不变。
 /// - 输入结束（EOF）同样结束输入。
 pub fn read_text<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     let mut lines = Vec::new();
@@ -24,12 +25,7 @@ pub fn read_text<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
             break;
         }
 
-        // 以 ".." 开头的行只去掉第一个点，字面量 "." 因此写成 ".."
-        let content = if trimmed.starts_with("..") {
-            &trimmed[1..]
-        } else {
-            trimmed
-        };
+        let content = trimmed.strip_prefix('.').unwrap_or(trimmed);
         lines.push(content.to_string());
     }
 
@@ -291,17 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn preserves_dot_prefixed_regular_lines() {
-        // 只有以 ".." 开头的行才脱壳，普通隐藏文件名原样保留
+    fn strips_one_dot_from_unescaped_dot_prefixed_lines() {
         let mut input = Cursor::new(".env\n.gitignore\n.\n");
-        assert_eq!(read_text(&mut input).unwrap(), ".env\n.gitignore");
+        assert_eq!(read_text(&mut input).unwrap(), "env\ngitignore");
     }
 
     #[test]
     fn unescapes_doubled_dot_prefixes() {
-        // 字面量 ".." 仍然可以表达：多打一个点
-        let mut input = Cursor::new("..gitignore\n...\n.\n");
-        assert_eq!(read_text(&mut input).unwrap(), ".gitignore\n..");
+        let mut input = Cursor::new("..env\n..gitignore\n...x\n...\n.\n");
+        assert_eq!(read_text(&mut input).unwrap(), ".env\n.gitignore\n..x\n..");
+    }
+
+    #[test]
+    fn preserves_dots_inside_body_lines() {
+        let mut input = Cursor::new("hello.world\nhello..world\n..env.local\n.\n");
+        assert_eq!(
+            read_text(&mut input).unwrap(),
+            "hello.world\nhello..world\n.env.local"
+        );
     }
 
     #[test]
